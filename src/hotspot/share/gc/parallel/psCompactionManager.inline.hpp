@@ -92,7 +92,7 @@ inline void ParCompactionManager::mark_and_push(T* p) {
       ContinuationGCSupport::transform_stack_chunk(obj);
 
       assert(_marking_stats_cache != nullptr, "inv");
-      _marking_stats_cache->push(obj, obj->size());
+      _marking_stats_cache->push(obj);
       push(obj);
     }
   }
@@ -156,9 +156,13 @@ inline void ParCompactionManager::MarkingStatsCache::push(size_t region_id, size
   entries[index].live_words = live_words;
 }
 
-inline void ParCompactionManager::MarkingStatsCache::push(oop obj, size_t live_words) {
+inline void ParCompactionManager::MarkingStatsCache::push(oop obj) {
   ParallelCompactData& data = PSParallelCompact::summary_data();
   const size_t region_size = ParallelCompactData::RegionSize;
+  size_t live_words = obj->size();
+  if (UseCompactObjectHeaders) {
+    live_words = obj->copy_size(live_words, obj->mark());
+  }
 
   HeapWord* addr = cast_from_oop<HeapWord*>(obj);
   const size_t start_region_id = data.addr_to_region_idx(addr);

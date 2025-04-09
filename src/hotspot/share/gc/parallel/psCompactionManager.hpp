@@ -142,7 +142,7 @@ class ParCompactionManager : public CHeapObj<mtGC> {
     inline void push(size_t region_id, size_t live_words);
 
   public:
-    inline void push(oop obj, size_t live_words);
+    inline void push(oop obj);
 
     inline void evict(size_t index);
 
