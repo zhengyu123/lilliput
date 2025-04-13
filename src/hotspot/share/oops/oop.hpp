@@ -342,8 +342,13 @@ class oopDesc {
   inline bool fast_no_hash_check();
 
   // Initialize identity hash code in hash word of object copy from original object.
-  // Returns true if the object has been expanded, false otherwise.
   inline void initialize_hash_if_necessary(oop obj);
+  // Initialize identity hash code in hash word of object copy from original mark word.
+  inline void initialize_hash_if_necessary(markWord m);
+
+  // Install original identity hash code to newly copied object
+  void install_identity_hash(intptr_t hash);
+
   // For CDS only.
   void initialize_hash_if_necessary(oop obj, Klass* k, markWord m);
 

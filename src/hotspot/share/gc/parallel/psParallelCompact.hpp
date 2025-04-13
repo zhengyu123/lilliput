@@ -868,6 +868,11 @@ protected:
   ObjectStartArray* const _start_array;
   size_t                  _offset;
 
+  // Record oops that need to have their identity hash code update later,
+  // if it is a partial object start
+  GrowableArray<oop>* _deferred_oops;
+  GrowableArray<intptr_t>* _deferred_hashes;
+
   inline void decrement_words_remaining(size_t words);
   // Update variables to indicate that word_count words were processed.
   inline void update_state(size_t words);
@@ -885,18 +890,27 @@ public:
 
   // If the object will fit (size <= words_remaining()), copy it to the current
   // destination, update the interior oops and the start array.
-  void do_addr(HeapWord* addr, size_t words);
+  void do_addr(HeapWord* addr, size_t obj_size, size_t obj_new_size, oop obj);
 
   inline MoveAndUpdateClosure(ParMarkBitMap* bitmap, size_t region);
+  ~MoveAndUpdateClosure() {
+    delete _deferred_oops;
+    delete _deferred_hashes;
+  }
 
   // Accessors.
   HeapWord* destination() const         { return _destination; }
   HeapWord* copy_destination() const    { return _destination + _offset; }
 
+  void push_deferred_oop(oop dest, intptr_t hash) {
+    _deferred_oops->push(dest);
+    _deferred_hashes->push(hash);
+  }
+
   // Copy enough words to fill this closure or to the end of an object,
   // whichever is smaller, starting at source(). The start array is not
   // updated.
-  void copy_partial_obj(size_t partial_obj_size);
+  void copy_partial_obj(size_t partial_obj_size, size_t partial_obj_new_size);
 
   virtual void complete_region(HeapWord* dest_addr, PSParallelCompact::RegionData* region_ptr);
 };
@@ -921,7 +935,9 @@ MoveAndUpdateClosure::MoveAndUpdateClosure(ParMarkBitMap* bitmap, size_t region_
   _source(nullptr),
   _destination(PSParallelCompact::summary_data().region_to_addr(region_idx)),
   _start_array(PSParallelCompact::start_array(PSParallelCompact::space_id(_destination))),
-  _offset(0) {}
+  _offset(0),
+  _deferred_oops(new GrowableArray<oop>(8)),
+  _deferred_hashes(new GrowableArray<intptr_t>(8)) {}
 
 inline void MoveAndUpdateClosure::update_state(size_t words)
 {

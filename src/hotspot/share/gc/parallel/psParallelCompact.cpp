@@ -434,9 +434,15 @@ size_t ParallelCompactData::live_words_in_space(const MutableSpace* space,
     bool first_set = false;
     for (/* empty */; cur_region < end_region; ++cur_region) {
       size_t live_words_in_region = _region_data[cur_region].data_size();
-      if (!first_set && live_words_in_region < RegionSize) {
-        *full_region_prefix_end = region_to_addr(cur_region);
-        first_set = true;
+      if (!first_set) {
+        if (live_words_in_region < RegionSize) {
+          *full_region_prefix_end = region_to_addr(cur_region);
+          first_set = true;
+        } else {
+            assert(UseCompactObjectHeaders, "Just check");
+            // We won't compact this region
+            live_words_in_region = RegionSize;
+        }
       }
       live_words += live_words_in_region;
     }
@@ -766,8 +772,14 @@ HeapWord* PSParallelCompact::compute_dense_prefix_for_old_space(MutableSpace* ol
   size_t max_waste = old_space->capacity_in_words() * (MarkSweepDeadRatio / 100.0);
   const RegionData* cur_region = start_region;
   for (/* empty */; cur_region < end_region; ++cur_region) {
-    assert(region_size >= cur_region->data_size(), "inv");
-    size_t dead_size = region_size - cur_region->data_size();
+    assert(UseCompactObjectHeaders || region_size >= cur_region->data_size(), "inv");
+     size_t live_words = cur_region->data_size();
+    if (live_words > region_size) {
+        assert(UseCompactObjectHeaders, "Sanity");
+        // The objects are not going to move, don't expand them
+        live_words = region_size;
+    }
+    size_t dead_size = region_size - live_words;
     if (max_waste < dead_size) {
       break;
     }
@@ -821,7 +833,7 @@ void PSParallelCompact::fill_dense_prefix_end(SpaceId id) {
     assert(!_mark_bitmap.is_marked(block_start), "inv");
     // There is exactly one heap word gap right before the dense prefix end, so we need a filler object.
     // The filler object will extend into region_after_dense_prefix.
-    const size_t obj_len = 2; // min-fill-size
+    const size_t obj_len = CollectedHeap::min_fill_size(); // min-fill-size
     HeapWord* const obj_beg = dense_prefix_end - 1;
     CollectedHeap::fill_with_object(obj_beg, obj_len);
     _mark_bitmap.mark_obj(obj_beg);
@@ -1581,7 +1593,12 @@ void PSParallelCompact::forward_to_new_addr() {
           FullGCForwarding::forward_to(obj, cast_to_oop(new_addr));
         }
         size_t obj_size = obj->size();
-        new_addr += obj_size;
+        size_t obj_new_size = obj_size;
+        markWord mark = obj->mark();
+        if (mark.is_hashed_not_expanded()) {
+            obj_new_size = obj->copy_size(obj_size, mark);
+        }
+        new_addr += obj_new_size;
         cur_addr += obj_size;
       }
     }
@@ -1673,8 +1690,10 @@ void PSParallelCompact::verify_forward() {
       } else {
         assert(FullGCForwarding::forwardee(obj) == cast_to_oop(bump_ptr), "inv");
       }
-      bump_ptr += obj->size();
-      cur_addr += obj->size();
+      size_t size = obj->size();
+      size_t new_size = obj->copy_size(size, obj->mark());
+      bump_ptr += new_size;
+      cur_addr += new_size;
     }
   }
 }
@@ -1887,7 +1906,8 @@ void PSParallelCompact::fill_dead_objs_in_dense_prefix(uint worker_id, uint num_
       break;
     }
     assert(bitmap->is_marked(live_start), "inv");
-    cur_addr = live_start + cast_to_oop(live_start)->size();
+    oop obj = cast_to_oop(live_start);
+    cur_addr = live_start + obj->copy_size(obj->size(), obj->mark());
   }
 }
 
@@ -2254,6 +2274,9 @@ void PSParallelCompact::fill_region(ParCompactionManager* cm, MoveAndUpdateClosu
       HeapWord* region_start = sd.region_align_down(closure.source());
       HeapWord* obj_start = bitmap->find_obj_beg_reverse(region_start, closure.source());
       HeapWord* obj_end;
+      oop obj = cast_to_oop(obj_start);
+
+      bool may_have_new_size = false;
       if (obj_start != closure.source()) {
         assert(bitmap->is_marked(obj_start), "inv");
         // Found the actual obj-start, try to find the obj-end using either
@@ -2267,16 +2290,35 @@ void PSParallelCompact::fill_region(ParCompactionManager* cm, MoveAndUpdateClosu
         if (partial_obj_start == obj_start) {
           // This obj extends to next region.
           obj_end = partial_obj_end(next_region_start);
+
+          // This is a start of partial object, we want to see if it will expand
+          // in destination due to hash code expansion. If so, we need to record
+          // it, so that we can install identity hash code in destination copy
+          markWord m = obj->mark();
+          if (m.is_hashed_not_expanded()) {
+             oop dest = cast_to_oop(closure.destination());
+             closure.push_deferred_oop(dest, obj->identity_hash());
+          }
         } else {
           // Completely contained in this region; safe to use size().
-          obj_end = obj_start + cast_to_oop(obj_start)->size();
+          obj_end = obj_start + obj->size();
+          may_have_new_size = true;
         }
       } else {
         // This obj extends to current region.
         obj_end = partial_obj_end(region_start);
+        may_have_new_size = true;
       }
+
       size_t partial_obj_size = pointer_delta(obj_end, closure.source());
-      closure.copy_partial_obj(partial_obj_size);
+      size_t partial_obj_new_size = partial_obj_size;
+
+      if (may_have_new_size) {
+        size_t obj_size = obj->size();
+        partial_obj_new_size  += obj->copy_size(obj_size, obj->mark());
+      }
+
+      closure.copy_partial_obj(partial_obj_size, partial_obj_new_size);
     }
 
     if (closure.is_full()) {
@@ -2314,13 +2356,19 @@ void PSParallelCompact::fill_region(ParCompactionManager* cm, MoveAndUpdateClosu
         break;
       }
       size_t obj_size;
+      size_t obj_new_size;
+      oop obj = oop();
+
       if (final_obj_start == cur_addr) {
         obj_size = pointer_delta(partial_obj_end(end_addr), cur_addr);
+        obj_new_size = obj_size;
       } else {
         // This obj doesn't extend into next region; size() is safe to use.
-        obj_size = cast_to_oop(cur_addr)->size();
+        obj = cast_to_oop(cur_addr);
+        obj_size = obj->size();
+        obj_new_size = obj->copy_size(obj_size, obj->mark());
       }
-      closure.do_addr(cur_addr, obj_size);
+      closure.do_addr(cur_addr, obj_size, obj_new_size, obj);
       cur_addr += obj_size;
     } while (cur_addr < end_addr && !closure.is_full());
 
@@ -2422,15 +2470,16 @@ void PSParallelCompact::initialize_shadow_regions(uint parallel_gc_threads)
   }
 }
 
-void MoveAndUpdateClosure::copy_partial_obj(size_t partial_obj_size)
+void MoveAndUpdateClosure::copy_partial_obj(size_t partial_obj_size, size_t partial_obj_new_size)
 {
-  size_t words = MIN2(partial_obj_size, words_remaining());
+  assert(partial_obj_new_size >= partial_obj_size, "Sanity");
+  size_t words = MIN2(partial_obj_new_size, words_remaining());
 
   // This test is necessary; if omitted, the pointer updates to a partial object
   // that crosses the dense prefix boundary could be overwritten.
   if (source() != copy_destination()) {
     DEBUG_ONLY(PSParallelCompact::check_new_location(source(), destination());)
-    Copy::aligned_conjoint_words(source(), copy_destination(), words);
+    Copy::aligned_conjoint_words(source(), copy_destination(), MIN2(partial_obj_size,  words_remaining()));
   }
   update_state(words);
 }
@@ -2440,29 +2489,35 @@ void MoveAndUpdateClosure::complete_region(HeapWord* dest_addr, PSParallelCompac
   region_ptr->set_completed();
 }
 
-void MoveAndUpdateClosure::do_addr(HeapWord* addr, size_t words) {
+void MoveAndUpdateClosure::do_addr(HeapWord* addr, size_t old_size, size_t new_size, oop old) {
   assert(destination() != nullptr, "sanity");
+  assert(new_size >= old_size, "Sanity");
   _source = addr;
 
   // The start_array must be updated even if the object is not moving.
   if (_start_array != nullptr) {
-    _start_array->update_for_block(destination(), destination() + words);
+    _start_array->update_for_block(destination(), destination() + new_size);
   }
 
   // Avoid overflow
-  words = MIN2(words, words_remaining());
-  assert(words > 0, "inv");
+  new_size = MIN2(new_size, words_remaining());
+  old_size = MIN2(old_size, words_remaining());
+  assert(old_size > 0, "inv");
 
   if (copy_destination() != source()) {
     DEBUG_ONLY(PSParallelCompact::check_new_location(source(), destination());)
     assert(source() != destination(), "inv");
     assert(FullGCForwarding::is_forwarded(cast_to_oop(source())), "inv");
     assert(FullGCForwarding::forwardee(cast_to_oop(source())) == cast_to_oop(destination()), "inv");
-    Copy::aligned_conjoint_words(source(), copy_destination(), words);
-    cast_to_oop(copy_destination())->init_mark();
+    Copy::aligned_conjoint_words(source(), copy_destination(), old_size);
+    oop dest = cast_to_oop(copy_destination());
+    dest->init_mark();
+    if (old_size != new_size) {
+      dest->initialize_hash_if_necessary(old);
+    }
   }
 
-  update_state(words);
+  update_state(new_size);
 }
 
 void MoveAndUpdateShadowClosure::complete_region(HeapWord* dest_addr, PSParallelCompact::RegionData* region_ptr) {

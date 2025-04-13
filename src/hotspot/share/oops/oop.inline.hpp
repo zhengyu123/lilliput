@@ -570,5 +570,12 @@ inline void oopDesc::initialize_hash_if_necessary(oop obj) {
   }
 }
 
+inline void oopDesc::initialize_hash_if_necessary(markWord m) {
+  if (!UseCompactObjectHeaders) {
+    return;
+  }
+
+}
+
 
 #endif // SHARE_OOPS_OOP_INLINE_HPP

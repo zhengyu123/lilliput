@@ -148,6 +148,23 @@ void oopDesc::initialize_hash_if_necessary(oop obj, Klass* k, markWord m) {
   set_mark(m);
 }
 
+void oopDesc::install_identity_hash(intptr_t hash) {
+  assert(UseCompactObjectHeaders, "only with compact object headers");
+  markWord m = mark();
+  assert(!m.has_displaced_mark_helper(), "must not be displaced header");
+  assert(m.is_hashed_not_expanded(), "must be hashed but not moved");
+  assert(!m.is_hashed_expanded(), "must not be moved: " INTPTR_FORMAT, m.value());
+  Klass* k = klass();
+  int offset = k->hash_offset_in_bytes(cast_to_oop(this), m);
+  assert(offset >= 4, "hash offset must not be in header");
+  int_field_put(offset, (jint) hash);
+  m = m.set_hashed_expanded();
+  assert(static_cast<uint32_t>(LightweightSynchronizer::get_hash(m, cast_to_oop(this), k)) == hash,
+         "hash must remain the same");
+  assert(m.narrow_klass() != 0, "must not be null");
+  set_mark(m);
+}
+
 // used only for asserts and guarantees
 bool oopDesc::is_oop_or_null(oop obj, bool ignore_mark_word) {
   return obj == nullptr ? true : is_oop(obj, ignore_mark_word);
